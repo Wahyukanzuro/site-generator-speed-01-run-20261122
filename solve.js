@@ -628,7 +628,8 @@ function renderMarkdown(src, env, ctx) {
     }
     const fenceLang = fenceOpenLang(src, s, e);
     if (fenceLang !== null) {
-      const bodyLines = [];
+      const cls = fenceLang === '' ? '' : ` class="language-${escapeHtml(fenceLang)}"`;
+      MD_OUT.push(`<pre><code${cls}>`);
       pos = next;
       while (pos < n) {
         const ls = pos;
@@ -639,12 +640,9 @@ function renderMarkdown(src, env, ctx) {
           pos = ln;
           break;
         }
-        bodyLines.push(src.slice(ls, le));
+        MD_OUT.push(escapeHtml(src.slice(ls, le)), '\n');
         pos = ln;
       }
-      const cls = fenceLang === '' ? '' : ` class="language-${escapeHtml(fenceLang)}"`;
-      MD_OUT.push(`<pre><code${cls}>`);
-      for (let k = 0; k < bodyLines.length; k++) { MD_OUT.push(escapeHtml(bodyLines[k]), '\n'); }
       MD_OUT.push('</code></pre>', '\n');
       continue;
     }
@@ -801,7 +799,10 @@ function renderMarkdown(src, env, ctx) {
       const ls = pos;
       const le = lineEnd(pos);
       const ln = le === n ? n : le + 1;
-      if (endsParagraph(src, ls, le)) break;
+      // A paragraph ends only on a line starting with space/tab, '#', '`', '-' or '*'
+      // (empty line reads as space); any other first char continues it — skip the classifiers.
+      const fc = le > ls ? src.charCodeAt(ls) : 32;
+      if ((fc === 32 || fc === 9 || fc === 35 || fc === 96 || fc === 45 || fc === 42) && endsParagraph(src, ls, le)) break;
       if (clean && (src.charCodeAt(ls) === 32 || src.charCodeAt(ls) === 9 || src.charCodeAt(le - 1) === 32 || src.charCodeAt(le - 1) === 9)) {
         // First dirty line: materialise plines from the clean prefix.
         clean = false;
@@ -1056,9 +1057,9 @@ const ESC_FIELDS = { title: 1, name: 1, url: 1, summary: 1, base_url: 1 };
  * access. Returns the full `H.textOf(...)` / `H.esc(H.textOf(...))` expression. */
 function escVarExpr(path) {
   if (path.length === 2 && ESC_FIELDS[path[1]] === 1) {
-    return `H.textOf(S.${path[0]}?.${path[1]}_esc)`;
+    return `(S.${path[0]}?.${path[1]}_esc ?? '')`;
   }
-  return `H.esc(H.textOf(${pathExpr(path)}))`;
+  return `H.esc(typeof (_v=${pathExpr(path)})==='string'?_v:H.textOf(_v))`;
 }
 
 /** JS code for `nodes` (a node array), appended to `out`. `ctr` yields unique ids.
@@ -1081,7 +1082,7 @@ function genNodes(nodes, ctr, out, tgt) {
     } else if (n.kind === 'var') {
       pend.push(escVarExpr(n.path));
     } else if (n.kind === 'raw') {
-      pend.push(`H.textOf(${pathExpr(n.path)})`);
+      pend.push(`(typeof (_v=${pathExpr(n.path)})==='string'?_v:H.textOf(_v))`);
     } else if (n.kind === 'invar') {
       // Invariant run: computed once per case into the per-template cache C and
       // pushed from there on every page. The run's code pushes to a scratch array.
@@ -1186,7 +1187,9 @@ function collapseInvariant(nodes) {
     // Maximal run of invariant nodes starting at i.
     let j = i;
     while (j < nodes.length && nodeIsInvariant(nodes[j], bound)) j++;
-    out.push({ kind: 'invar', nodes: nodes.slice(i, j) });
+    const run = nodes.slice(i, j);
+    if (run.every((x) => x.kind === 'text')) out.push({ kind: 'text', text: run.map((x) => x.text).join('') });
+    else out.push({ kind: 'invar', nodes: run });
     i = j;
   }
   return out;
@@ -1196,7 +1199,7 @@ function collapseInvariant(nodes) {
  * It appends its output to the shared array `O`; the caller joins `O` once. */
 function compileTemplate(nodes) {
   const ctr = { next: 0, iv: 0 };
-  const out = [];
+  const out = ['let _v;'];
   genNodes(nodes, ctr, out, 'O');
   return new Function('S', 'T', 'D', 'H', 'O', 'C', out.join(''));
 }
@@ -1317,15 +1320,19 @@ function markdown(b) {
         if (rel === '') {
           path = null;
         } else {
-          const pkey = dir + '\0' + rel;
-          path = pathCache.get(pkey);
+          let m = pathCache.get(dir);
+          if (m === undefined) { m = new Map(); pathCache.set(dir, m); }
+          path = m.get(rel);
           if (path === undefined) {
             path = resolvePath(dir, rel);
-            pathCache.set(pkey, path);
+            m.set(rel, path);
           }
         }
-        if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
+        if (path !== null) {
+          const src = b.bySource.get(path);
+          if (src !== undefined) return frag === '' ? src.url : src.url + frag;
+          if (staticPaths.has(path)) return `${b.base}/${path}${frag}`;
+        }
         b.broken.add(`broken-link ${s.path} -> ${target}`);
         return target;
       },
@@ -1432,8 +1439,8 @@ function layouts(b) {
   const templates = new Map();
   for (const [name, nodes] of b.templates) {
     const fn = compileTemplate(collapseInvariant(nodes));
-    const C = [];
-    templates.set(name, (S, T, D, H, O) => fn(S, T, D, H, O, C));
+    fn._C = [];
+    templates.set(name, fn);
   }
   // One context object per case, reused across all page renders (mutated, then reset).
   const ctx = { site, tags: b.tags, recent, page: null, posts: null, pager: null, tag: null };
@@ -1443,7 +1450,7 @@ function layouts(b) {
     if (k1 !== undefined) ctx[k1] = v1;
     if (k2 !== undefined) ctx[k2] = v2;
     PAGE_OUT.length = 0;
-    fn(ctx, templates, 0, TEMPLATE_HELPERS, PAGE_OUT);
+    fn(ctx, templates, 0, TEMPLATE_HELPERS, PAGE_OUT, fn._C);
     const html = PAGE_OUT.join('');
     PAGE_OUT.length = 0;
     if (k1 !== undefined) ctx[k1] = null;
