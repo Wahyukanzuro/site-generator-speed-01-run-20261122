@@ -1066,11 +1066,12 @@ function escVarExpr(path) {
  * a per-call local), so `{% include %}` passes the same `O` down instead of
  * allocating a fresh array + join per include. Consecutive push arguments are
  * batched into one multi-argument `O.push(a, b, c)` call. */
-function genNodes(nodes, ctr, out) {
+function genNodes(nodes, ctr, out, tgt) {
+  tgt = tgt || 'O';
   let pend = []; // pending push arguments, flushed as one O.push(a, b, c)
   const flush = () => {
     if (pend.length > 0) {
-      out.push(`O.push(${pend.join(',')});`);
+      out.push(`${tgt}.push(${pend.join(',')});`);
       pend = [];
     }
   };
@@ -1081,13 +1082,21 @@ function genNodes(nodes, ctr, out) {
       pend.push(escVarExpr(n.path));
     } else if (n.kind === 'raw') {
       pend.push(`H.textOf(${pathExpr(n.path)})`);
+    } else if (n.kind === 'invar') {
+      // Invariant run: computed once per case into the per-template cache C and
+      // pushed from there on every page. The run's code pushes to a scratch array.
+      flush();
+      const k = ctr.iv++;
+      out.push(`if(C[${k}]===undefined){const _O${k}=[];`);
+      genNodes(n.nodes, ctr, out, `_O${k}`);
+      out.push(`C[${k}]=_O${k}.join('');}${tgt}.push(C[${k}]);`);
     } else if (n.kind === 'if') {
       flush();
       out.push(`if(H.truthy(${pathExpr(n.path)})!==${n.not}){`);
-      genNodes(n.then, ctr, out);
+      genNodes(n.then, ctr, out, tgt);
       if (n.else !== null) {
         out.push('}else{');
-        genNodes(n.else, ctr, out);
+        genNodes(n.else, ctr, out, tgt);
       }
       out.push('}');
     } else if (n.kind === 'for') {
@@ -1098,13 +1107,13 @@ function genNodes(nodes, ctr, out) {
       out.push(`const _ox${k}=S[${nm}];const _hx${k}=Object.hasOwn(S,${nm});const _ol${k}=S["loop"];const _hl${k}=Object.hasOwn(S,"loop");`);
       out.push(`const _L${k}={index:0,first:false,last:false,length:A${k}.length};`);
       out.push(`for(let _i${k}=0;_i${k}<A${k}.length;_i${k}++){S[${nm}]=A${k}[_i${k}];S["loop"]=_L${k};_L${k}.index=_i${k}+1;_L${k}.first=_i${k}===0;_L${k}.last=_i${k}===A${k}.length-1;`);
-      genNodes(n.body, ctr, out);
+      genNodes(n.body, ctr, out, tgt);
       out.push('}');
       out.push(`if(_hx${k})S[${nm}]=_ox${k};else delete S[${nm}];if(_hl${k})S["loop"]=_ol${k};else delete S["loop"];}}`);
     } else if (n.kind === 'include') {
       flush();
       const k = ctr.next++;
-      out.push(`if(D<${INCLUDE_DEPTH}){const _f${k}=T.get(${JSON.stringify(n.name)});if(_f${k})_f${k}(S,T,D+1,H,O);}`);
+      out.push(`if(D<${INCLUDE_DEPTH}){const _f${k}=T.get(${JSON.stringify(n.name)});if(_f${k})_f${k}(S,T,D+1,H,${tgt});}`);
     }
   }
   flush();
@@ -1162,13 +1171,13 @@ function nodeIsInvariant(n, bound) {
   return false; // include nodes are gone after expandAst; anything else is variant
 }
 
-/** Stage C — collapse invariant node runs to pre-rendered static text. Walks `nodes`
- * (an expanded AST) and replaces each maximal run of consecutive invariant nodes with
- * a single `{ kind: 'text', text: <pre-rendered HTML> }` node. `invScope` is the
- * per-case invariant scope `{ site, tags, recent }`. Invariant `for`/`if` nodes are
- * pre-rendered as a whole (their loops/branches execute once, here), so the main
- * template function never re-runs them. Returns a new node array. */
-function collapseInvariant(nodes, invScope) {
+/** Stage C — collapse invariant node runs into lazy-cache nodes. Walks `nodes`
+ * (an expanded AST) and replaces each maximal run of consecutive invariant nodes
+ * with a single `{ kind: 'invar', nodes: run }` node. The main template function
+ * computes the run once per case (on the first page, into its per-template cache
+ * C) and pushes the cached string on every page — zero extra `new Function`
+ * compilations, zero interpreter. Returns a new node array. */
+function collapseInvariant(nodes) {
   const out = [];
   let i = 0;
   const bound = new Set();
@@ -1177,12 +1186,7 @@ function collapseInvariant(nodes, invScope) {
     // Maximal run of invariant nodes starting at i.
     let j = i;
     while (j < nodes.length && nodeIsInvariant(nodes[j], bound)) j++;
-    const run = nodes.slice(i, j);
-    const fn = compileTemplate(run);
-    const buf = [];
-    fn(invScope, null, 0, TEMPLATE_HELPERS, buf);
-    const html = buf.join('');
-    if (html !== '') out.push({ kind: 'text', text: html });
+    out.push({ kind: 'invar', nodes: nodes.slice(i, j) });
     i = j;
   }
   return out;
@@ -1191,10 +1195,10 @@ function collapseInvariant(nodes, invScope) {
 /** A parsed template's nodes compiled to a render function (S, T, D, H, O) => void.
  * It appends its output to the shared array `O`; the caller joins `O` once. */
 function compileTemplate(nodes) {
-  const ctr = { next: 0 };
+  const ctr = { next: 0, iv: 0 };
   const out = [];
-  genNodes(nodes, ctr, out);
-  return new Function('S', 'T', 'D', 'H', 'O', out.join(''));
+  genNodes(nodes, ctr, out, 'O');
+  return new Function('S', 'T', 'D', 'H', 'O', 'C', out.join(''));
 }
 
 // ---- the build pipeline (reference: index.js, plugins in order) ----
@@ -1373,7 +1377,7 @@ function tags(b) {
     if (!s.post) {
       s.tagRefs = ownTags(s).map((name) => {
         const slug = slugifyMemo(name, b.slugMemo);
-        return bySlug.get(slug) ?? { name, slug, url: '', posts: [] };
+        return bySlug.get(slug) ?? { name, slug, url: '', posts: [], name_esc: escapeHtml(name), url_esc: escapeHtml(''), count: 0 };
       });
     }
   }
@@ -1383,39 +1387,6 @@ function tags(b) {
 /** A page's link record as templates read it. */
 const linkOf = (s) => (s === null ? null : { title: s.data.title, title_esc: escapeHtml(s.data.title), url: s.url, url_esc: escapeHtml(s.url), date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
 
-/** A tag as templates read it (its posts as cards). */
-const tagOf = (b, t) => ({ name: t.name, name_esc: escapeHtml(t.name), slug: t.slug, url: t.url, url_esc: escapeHtml(t.url), count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
-
-/** A post's card, as lists show it. */
-function cardOf(s) {
-  return {
-    title: s.data.title,
-    title_esc: escapeHtml(s.data.title),
-    url: s.url,
-    url_esc: escapeHtml(s.url),
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    summary_esc: escapeHtml(s.data.summary ?? ''),
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, name_esc: escapeHtml(t.name), slug: t.slug, url: t.url, url_esc: escapeHtml(t.url) })),
-  };
-}
-
-/** A page as its layout reads it. */
-function pageOf(s) {
-  return {
-    ...cardOf(s),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  };
-}
-
 /** 7. Every page through its layout, the index pages and the tag pages through theirs. */
 /** One output array reused across every page render in a case (module-level, stable
  * capacity). render() resets its length to 0, calls the template with it, joins it,
@@ -1423,46 +1394,80 @@ function pageOf(s) {
 const PAGE_OUT = [];
 
 function layouts(b) {
-  b.cards = new Map(b.posts.map((p) => [p, cardOf(p)]));
+  // Fill the template view fields directly on the sources and tags, once per
+  // case. With --no-opt there is no Escape Analysis, so cardOf/pageOf/linkOf/
+  // tagOf would allocate a fresh object per page; the source object IS the card
+  // and the page (same fields, same values) and the tag object IS the tag view,
+  // so render() allocates zero new objects. s.toc entries are already exactly
+  // {level, id, html} and s.newer/s.older are read only here, so they are
+  // overwritten with their link records.
+  for (const s of b.sources) {
+    s.title = s.data.title;
+    s.title_esc = escapeHtml(s.data.title);
+    s.url_esc = escapeHtml(s.url);
+    s.date = s.data.date ?? '';
+    s.date_long = s.data.date === undefined ? '' : longDate(s.data.date);
+    s.summary = s.data.summary ?? '';
+    s.summary_esc = escapeHtml(s.data.summary ?? '');
+    s.reading_minutes = Math.max(1, Math.ceil(s.words / 200));
+    s.content = s.html;
+    s.is_post = s.post;
+    s.tags = s.tagRefs;
+    s.newer = linkOf(s.newer ?? null);
+    s.older = linkOf(s.older ?? null);
+  }
+  for (const t of b.tags) {
+    t.name_esc = escapeHtml(t.name);
+    t.url_esc = escapeHtml(t.url);
+    t.count = t.posts.length;
+  }
   const site = { title: b.input.site.title, title_esc: escapeHtml(b.input.site.title), base_url: b.base, base_url_esc: escapeHtml(b.base) };
-  const allTags = b.tags.map((t) => ({ name: t.name, name_esc: escapeHtml(t.name), slug: t.slug, url: t.url, url_esc: escapeHtml(t.url), count: t.posts.length }));
-  const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  // Stages B/C: collapse each expanded AST's invariant runs (pre-rendered once per
-  // case with the invariant scope) and compile the result. The layout functions
-  // then only execute the variant (page/posts/pager/tag) parts per page.
-  const invScope = { site, tags: allTags, recent };
+  const recent = b.posts.slice(0, b.input.site.recent);
+  // Stages B/C: collapse each expanded AST's invariant runs into lazy-cache
+  // nodes and compile the result. Each compiled template gets a fresh per-case
+  // cache array C via a wrapper, so the invariant code runs inside the same
+  // Maglev-compiled function with zero extra `new Function` calls and zero
+  // interpreter. The layout functions then only execute the variant
+  // (page/posts/pager/tag) parts per page.
   const templates = new Map();
-  for (const [name, nodes] of b.templates) templates.set(name, compileTemplate(collapseInvariant(nodes, invScope)));
+  for (const [name, nodes] of b.templates) {
+    const fn = compileTemplate(collapseInvariant(nodes));
+    const C = [];
+    templates.set(name, (S, T, D, H, O) => fn(S, T, D, H, O, C));
+  }
   // One context object per case, reused across all page renders (mutated, then reset).
-  const ctx = { site, tags: allTags, recent, page: null, posts: null, pager: null, tag: null };
-  const render = (name, vars) => {
+  const ctx = { site, tags: b.tags, recent, page: null, posts: null, pager: null, tag: null };
+  const render = (name, k1, v1, k2, v2) => {
     const fn = templates.get(name);
     if (fn === undefined) return null;
-    const keys = Object.keys(vars);
-    for (let i = 0; i < keys.length; i++) ctx[keys[i]] = vars[keys[i]];
+    if (k1 !== undefined) ctx[k1] = v1;
+    if (k2 !== undefined) ctx[k2] = v2;
     PAGE_OUT.length = 0;
     fn(ctx, templates, 0, TEMPLATE_HELPERS, PAGE_OUT);
     const html = PAGE_OUT.join('');
     PAGE_OUT.length = 0;
-    for (let i = 0; i < keys.length; i++) ctx[keys[i]] = null;
+    if (k1 !== undefined) ctx[k1] = null;
+    if (k2 !== undefined) ctx[k2] = null;
     return html;
   };
-  for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+  for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, 'page', s);
   const per = b.input.site.per_page;
   const pages = Math.max(1, Math.ceil(b.posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${b.base}/` : `${b.base}/page/${k}/`);
+  const pager = { number: 0, total: pages, url: '', newer_url: '', older_url: '' };
   for (let k = 1; k <= pages; k++) {
-    const html = render('index', {
-      posts: b.posts.slice((k - 1) * per, k * per).map((p) => b.cards.get(p)),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
+    pager.number = k;
+    pager.url = indexUrl(k);
+    pager.newer_url = k === 1 ? '' : indexUrl(k - 1);
+    pager.older_url = k === pages ? '' : indexUrl(k + 1);
+    const html = render('index', 'posts', b.posts.slice((k - 1) * per, k * per), 'pager', pager);
     if (html !== null) b.output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   for (const t of b.tags) {
-    const html = render('tag', { tag: tagOf(b, t) });
+    const html = render('tag', 'tag', t);
     if (html !== null) b.output[`tags/${t.slug}/index.html`] = html;
   }
-  const tagsHtml = render('tags', {});
+  const tagsHtml = render('tags');
   if (tagsHtml !== null) b.output['tags/index.html'] = tagsHtml;
   for (const f of b.statics) {
     if (Object.hasOwn(b.output, f.path)) b.report.push(`shadowed ${f.path}: a built page has its path`);
@@ -1512,7 +1517,6 @@ export function build(input) {
     report,
     posts: [],
     tags: [],
-    cards: new Map(),
     output: {},
     slugMemo: new Map(),
   };
